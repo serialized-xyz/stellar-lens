@@ -224,12 +224,12 @@ export async function readAccount(account: string): Promise<LedgerRead<AccountSt
 
 // ---------------------------------------------------------------- SEP-41
 
-async function simulateCall(contractId: string, source: string, fn: string, args: xdr.ScVal[] = []) {
+async function simulateCall(contractId: string, source: string, fn: string, args: xdr.ScVal[] = [], ttlMs = 30_000) {
   const tx = new TransactionBuilder(new Account(source, '0'), { fee: '100', networkPassphrase: NETWORK_PASSPHRASE })
     .addOperation(new Contract(contractId).call(fn, ...args))
     .setTimeout(0)
     .build();
-  const { result, endpoint } = await simulateTransaction(tx.toXDR());
+  const { result, endpoint } = await simulateTransaction(tx.toXDR(), ttlMs);
   if (result.error) throw new Error(`${fn}() simulation failed: ${result.error.split('\n')[0]}`);
   const ret = result.results?.[0]?.xdr;
   if (!ret) throw new Error(`${fn}() simulation returned no value`);
@@ -243,25 +243,56 @@ export interface Sep41Balance {
   symbol: string;
   name: string;
   latestLedger: number;
+  /** RPC endpoint that simulated balance(). */
+  endpoint: string;
 }
 
-/** balance(), decimals(), symbol() and name() of a SEP-41 token, read by simulation (no transaction is ever submitted). */
-export async function readSep41(contractId: string, holder: string): Promise<Sep41Balance> {
-  const [bal, dec, sym, name] = await Promise.all([
-    simulateCall(contractId, holder, 'balance', [new Address(holder).toScVal()]),
-    simulateCall(contractId, holder, 'decimals'),
-    simulateCall(contractId, holder, 'symbol'),
-    simulateCall(contractId, holder, 'name'),
+interface Sep41Meta {
+  decimals: number;
+  symbol: string;
+  name: string;
+}
+
+/** decimals(), symbol() and name() do not depend on the holder: simulated once per contract per session. */
+const metaCache = new Map<string, Promise<Sep41Meta>>();
+
+function sep41Meta(contractId: string, source: string): Promise<Sep41Meta> {
+  const hit = metaCache.get(contractId);
+  if (hit) return hit;
+  const p = (async () => {
+    const [dec, sym, name] = await Promise.all([
+      simulateCall(contractId, source, 'decimals'),
+      simulateCall(contractId, source, 'symbol'),
+      simulateCall(contractId, source, 'name'),
+    ]);
+    const decimals = Number(dec.value);
+    if (!Number.isInteger(decimals) || decimals < 0 || decimals > 38) throw new Error(`implausible decimals() ${String(dec.value)}`);
+    return { decimals, symbol: String(sym.value), name: String(name.value) };
+  })();
+  // A failed read is not kept: the next account load retries it.
+  p.catch(() => metaCache.delete(contractId));
+  metaCache.set(contractId, p);
+  return p;
+}
+
+/**
+ * balance(), decimals(), symbol() and name() of a SEP-41 token, read by
+ * simulation (no transaction is ever submitted). `fresh` skips the response
+ * cache, for Verify.
+ */
+export async function readSep41(contractId: string, holder: string, opts: { fresh?: boolean } = {}): Promise<Sep41Balance> {
+  const [bal, meta] = await Promise.all([
+    simulateCall(contractId, holder, 'balance', [new Address(holder).toScVal()], opts.fresh ? 0 : 30_000),
+    sep41Meta(contractId, holder),
   ]);
   if (typeof bal.value !== 'bigint') throw new Error(`balance() returned ${typeof bal.value}, expected i128`);
-  const decimals = Number(dec.value);
-  if (!Number.isInteger(decimals) || decimals < 0 || decimals > 38) throw new Error(`implausible decimals() ${String(dec.value)}`);
   return {
     contractId,
     balance: bal.value,
-    decimals,
-    symbol: String(sym.value),
-    name: String(name.value),
+    decimals: meta.decimals,
+    symbol: meta.symbol,
+    name: meta.name,
     latestLedger: bal.latestLedger,
+    endpoint: bal.endpoint,
   };
 }

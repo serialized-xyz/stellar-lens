@@ -2,24 +2,31 @@
 // envelope and field names of GET /v1/wallet/positions, /v1/wallet/transfers
 // and /v1/wallet/swaps (EVM and Solana today). Stellar-specific fields live
 // under a "stellar" sub-object on each item. Computed client-side in this
-// preview: nothing here is served by api.serialized.xyz.
+// preview: nothing here is served by the Serialized API.
 
 import { CHAIN_ID, USDC_ID, explorer } from './config.ts';
-import { fromStroops, toNumber } from './amount.ts';
+import { fromStroops, toNumber, toStroops } from './amount.ts';
 import type { ActivityRow, AssetAmount } from './activity.ts';
 import type { Holding, PositionsModel } from './positions.ts';
 
-/** The API rounds USD figures to 6 significant digits. */
-export const usd6 = (n: number | null): number | null => (n === null || !Number.isFinite(n) ? null : Number(n.toPrecision(6)));
-
-const pct4 = (n: number) => Number(n.toFixed(4));
+/** USD figures are served unrounded, as the API serves them; NaN and infinities become null. */
+const num = (n: number | null | undefined): number | null => (n === null || n === undefined || !Number.isFinite(n) ? null : n);
 
 export const positionsPath = (wallet: string) =>
   `/v1/wallet/positions?chain=${CHAIN_ID}&wallet=${wallet}&includeNative=true&includeStables=true&minValueUsd=0&minLiquidityUsd=0`;
-export const transfersPath = (wallet: string) => `/v1/wallet/transfers?chain=${CHAIN_ID}&wallet=${wallet}&limit=50`;
-export const swapsPath = (wallet: string) => `/v1/wallet/swaps?chain=${CHAIN_ID}&wallet=${wallet}&limit=50`;
+const withCursor = (cursor: string | null) => (cursor ? `&cursor=${cursor}` : '');
+export const transfersPath = (wallet: string, cursor: string | null = null) =>
+  `/v1/wallet/transfers?chain=${CHAIN_ID}&wallet=${wallet}&limit=50${withCursor(cursor)}`;
+export const swapsPath = (wallet: string, cursor: string | null = null) =>
+  `/v1/wallet/swaps?chain=${CHAIN_ID}&wallet=${wallet}&limit=50${withCursor(cursor)}`;
 
-/** Fields the Serialized API derives from the wallet's trade history. */
+/**
+ * Fields the Serialized API derives from the wallet's trade history. This
+ * preview does not read trade history, so they are null on position rows,
+ * and the payload says so in meta.stellar.tradeHistory. 0 would claim
+ * "never traded", which the preview cannot know (the API serves 0 for a
+ * holding it has seen arrive without a trade).
+ */
 const TRADE_FIELDS_NULL = {
   entryPriceUsd: null,
   entryPriceLifetimeUsd: null,
@@ -72,6 +79,9 @@ export const POSITION_FIELDS = [
   'labels', 'share',
 ] as const;
 
+/** Trade-derived fields left null on position rows in this preview (see TRADE_FIELDS_NULL). */
+export const PREVIEW_NULL_FIELDS = Object.keys(TRADE_FIELDS_NULL) as ReadonlyArray<keyof typeof TRADE_FIELDS_NULL>;
+
 /** Re-emits a row in the API's field order, with the Stellar sub-object last. */
 function inApiOrder(row: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -86,20 +96,18 @@ function valuationFields(h: Holding) {
     priceSource: v.source,
     priceDetail: v.detail,
     unpricedReason: v.state === 'unpriced' ? v.reason : null,
-    valueAtDepthRatio: v.depthRatio === null ? null : Number(v.depthRatio.toFixed(4)),
+    valueAtDepthRatio: num(v.depthRatio),
   };
 }
 
 function positionItem(h: Holding, totalValueUsd: number) {
-  const amountUsd = usd6(h.valuation.valueUsd);
-  const share = amountUsd === null || totalValueUsd <= 0 ? null : pct4(((h.valuation.valueUsd ?? 0) / totalValueUsd) * 100);
+  const amountUsd = num(h.valuation.valueUsd);
+  const share = amountUsd === null || totalValueUsd <= 0 ? null : (amountUsd / totalValueUsd) * 100;
   const common = {
-    chain: CHAIN_ID,
     decimals: h.decimals,
     amount: h.amount,
     amountUsd,
-    currentPriceUsd: usd6(h.valuation.priceUsd),
-    marketCapUsd: null,
+    currentPriceUsd: num(h.valuation.priceUsd),
     labels: [] as string[],
     share,
   };
@@ -206,16 +214,19 @@ function positionItem(h: Holding, totalValueUsd: number) {
           feeBp: h.pool?.feeBp ?? null,
           totalShares: h.pool?.totalShares ?? null,
           totalTrustlines: h.pool?.totalTrustlines ?? null,
-          sharePercent: h.pool ? Number(h.pool.sharePercent.toPrecision(6)) : null,
+          sharePercent: h.pool ? h.pool.sharePercent : null,
           reserves:
             h.pool?.reserves.map((r) => ({
               asset: r.assetId,
               poolAmount: r.poolAmount,
               amount: r.amount,
-              amountUsd: usd6(r.valueUsd),
+              priceUsd: num(r.priceUsd),
+              amountUsd: num(r.valueUsd),
+              valueAtDepthRatio: num(r.depthRatio),
             })) ?? null,
+          // CAP-38: a pool-share trustline carries no authorization flags of
+          // its own; authorization follows the trustlines of the two assets.
           trustline: {
-            authorized: h.flags.authorized,
             limit: h.limit,
             sponsor: h.sponsor,
             lastModifiedLedger: h.lastModifiedLedger,
@@ -261,7 +272,8 @@ export function positionsJson(m: PositionsModel) {
     meta: {
       asOf: m.asOf,
       summary: {
-        totalValueUsd: usd6(total),
+        totalValueUsd: num(total),
+        // Wallet-level PnL needs the trade history: null in this preview (see meta.stellar.tradeHistory).
         realizedPnlUsd: null,
         unrealizedPnlUsd: null,
         totalPnlUsd: null,
@@ -276,6 +288,7 @@ export function positionsJson(m: PositionsModel) {
         baseReserve: fromStroops(BigInt(m.ledger.base_reserve_in_stroops)),
         emptyTrustlines: m.emptyTrustlines.length,
         sep41Checked: m.sep41.map((c) => c.entry.contractId),
+        tradeHistory: 'not_indexed_in_preview',
         preview: true,
       },
     },
@@ -285,14 +298,15 @@ export function positionsJson(m: PositionsModel) {
 const tokenSymbol = (a: AssetAmount) => (a.asset === 'native' ? 'XLM' : a.code);
 
 /** USD value at transfer time: only known for Circle USDC (face value) in this preview. */
-const faceUsd = (a: AssetAmount): number | null => (a.asset === USDC_ID ? usd6(Number(a.amount)) : null);
+const faceUsd = (a: AssetAmount): number | null => (a.asset === USDC_ID ? num(Number(a.amount)) : null);
 
 function stellarOf(r: ActivityRow) {
   return {
     operationId: r.id,
     operationType: r.operationType,
     memo: r.memo,
-    muxedId: r.muxedId,
+    fromMuxedId: r.fromMuxedId,
+    toMuxedId: r.toMuxedId,
     ledger: r.ledger,
     conversion: r.conversion
       ? {
@@ -303,15 +317,36 @@ function stellarOf(r: ActivityRow) {
           path: r.conversion.path,
         }
       : null,
+    contract: r.contract ? { id: r.contract.id, function: r.contract.fn } : null,
     explorerUrl: r.explorerUrl,
   };
 }
 
-/** Rows of /v1/wallet/transfers: every token movement in or out, except the wallet's own swaps. */
-export function transfersJson(rows: readonly ActivityRow[], page: { hasMore: boolean; nextCursor: string | null }, asOf: number) {
-  const data: unknown[] = [];
+export interface ActivityJsonContext {
+  /** Base G account of the page. */
+  wallet: string;
+  /** Muxed id when an M address was entered (directions are relative to it). */
+  muxedId: string | null;
+  /** When the page was read from Horizon, unix ms. */
+  asOf: number;
+  /** Earliest instant Horizon serves history for, unix ms (null when unknown). */
+  historyFrom: number | null;
+}
+
+/** True for the account's own swaps (path payments and contract swaps): they belong to /swaps, not /transfers. */
+const isOwnSwap = (r: ActivityRow) => r.kind === 'swap' && r.direction === 'self';
+
+/**
+ * Rows of /v1/wallet/transfers: every token movement in or out of the
+ * account, one row per asset moved. A transaction that only swapped adds
+ * none, as in the API; payments to self add none.
+ */
+export function transfersJson(rows: readonly ActivityRow[], page: { hasMore: boolean; nextCursor: string | null }, ctx: ActivityJsonContext) {
+  const data: Array<Record<string, unknown> & { at: number }> = [];
   for (const r of rows) {
-    if (r.kind === 'swap' && r.direction === 'self') continue;
+    if (isOwnSwap(r)) continue;
+    // A payment to self moves nothing in or out. Contract calls that took and
+    // paid back the same asset (not a swap) are real movements both ways.
     if (r.direction === 'self' && r.kind !== 'contract') continue;
     const push = (a: AssetAmount, direction: 'in' | 'out') => {
       if (a.asset.startsWith('pool:')) return;
@@ -325,21 +360,21 @@ export function transfersJson(rows: readonly ActivityRow[], page: { hasMore: boo
         amount: a.amount,
         amountUsd: faceUsd(a),
         counterparty: r.counterparty,
-        stellar: stellarOf(r),
+        stellar: { ...stellarOf(r), supplyEvent: a.event ?? null },
       });
     };
     for (const a of r.debit) push(a, 'out');
     for (const a of r.credit) push(a, 'in');
   }
-  const ats = rows.map((r) => r.at);
   return {
     data,
     meta: {
-      asOf,
+      asOf: ctx.asOf,
       hasMore: page.hasMore,
       ...(page.hasMore && page.nextCursor ? { nextCursor: page.nextCursor } : {}),
-      oldestAt: ats.length ? Math.min(...ats) : null,
-      stellar: { source: 'payments', preview: true },
+      ...(data.length ? { oldestAt: Math.min(...data.map((d) => d.at)) } : {}),
+      ...(ctx.historyFrom !== null ? { historyFrom: ctx.historyFrom } : {}),
+      stellar: { source: 'horizon_payments', pageUnit: 'operations', muxedId: ctx.muxedId, preview: true },
     },
   };
 }
@@ -352,28 +387,53 @@ interface SwapAsset {
   amount: number;
 }
 
-/** Rows of /v1/wallet/swaps: the wallet's own path payments (source and destination are the wallet), one row per transaction. */
-export function swapsJson(rows: readonly ActivityRow[], page: { hasMore: boolean; nextCursor: string | null }, asOf: number) {
+const symbolOf = (asset: string) => (asset === 'native' ? 'XLM' : asset.split(':')[0]);
+
+/**
+ * Net flows of a transaction's swap legs, as the API nets them: what left the
+ * wallet is `sent`, what arrived is `received`, an asset that only passed
+ * through cancels out. Exact on stroops, largest first.
+ */
+function netFlows(legs: readonly ActivityRow[]): { sent: SwapAsset[]; received: SwapAsset[] } {
+  const net = new Map<string, bigint>();
+  for (const l of legs) {
+    for (const a of l.debit) net.set(a.asset, (net.get(a.asset) ?? 0n) - toStroops(a.amount));
+    for (const a of l.credit) net.set(a.asset, (net.get(a.asset) ?? 0n) + toStroops(a.amount));
+  }
+  const sent: SwapAsset[] = [];
+  const received: SwapAsset[] = [];
+  for (const [asset, v] of net) {
+    if (v === 0n) continue;
+    const row = { tokenAddress: asset, symbol: symbolOf(asset), name: null, decimals: 7, amount: toNumber(v < 0n ? -v : v) };
+    (v < 0n ? sent : received).push(row);
+  }
+  const byAmount = (a: SwapAsset, b: SwapAsset) => b.amount - a.amount;
+  return { sent: sent.sort(byAmount), received: received.sort(byAmount) };
+}
+
+/**
+ * Rows of /v1/wallet/swaps: the account's own swaps, one row per
+ * transaction. On Stellar these are path payments whose source and
+ * destination are both the account, and Soroban contract calls that took one
+ * asset and paid another (AMM and aggregator swaps through Stellar Asset
+ * Contracts).
+ */
+export function swapsJson(rows: readonly ActivityRow[], page: { hasMore: boolean; nextCursor: string | null }, ctx: ActivityJsonContext) {
   const byTx = new Map<string, ActivityRow[]>();
   for (const r of rows) {
-    if (r.kind !== 'swap' || r.direction !== 'self' || !r.conversion) continue;
+    if (!isOwnSwap(r)) continue;
     const list = byTx.get(r.txHash) ?? [];
     list.push(r);
     byTx.set(r.txHash, list);
   }
-  const net = (legs: AssetAmount[]): SwapAsset[] => {
-    const sums = new Map<string, number>();
-    for (const l of legs) sums.set(l.asset, (sums.get(l.asset) ?? 0) + toNumber(l.amount));
-    return [...sums.entries()]
-      .map(([asset, amount]) => ({ tokenAddress: asset, symbol: asset === 'native' ? 'XLM' : asset.split(':')[0], name: null, decimals: 7, amount }))
-      .sort((a, b) => b.amount - a.amount);
-  };
   const data = [...byTx.values()].map((legs) => {
     const first = legs[0];
-    const sent = net(legs.map((l) => l.conversion!.source));
-    const received = net(legs.map((l) => l.conversion!.destination));
+    const { sent, received } = netFlows(legs);
     const xlmSide = [...sent, ...received].find((a) => a.tokenAddress === 'native');
     const usdcSide = [...sent, ...received].find((a) => a.tokenAddress === USDC_ID);
+    // The API's feesNative is the fee this wallet paid for the transaction:
+    // 0 when another account (a channel or fee-bump account) paid it.
+    const feesNative = first.feeXlm === null || first.feePaidBy === null ? null : first.feePaidBy === ctx.wallet ? Number(first.feeXlm) : 0;
     return {
       id: first.txHash,
       at: first.at,
@@ -383,26 +443,34 @@ export function swapsJson(rows: readonly ActivityRow[], page: { hasMore: boolean
       sent,
       received,
       volumeNative: xlmSide ? xlmSide.amount : null,
-      volumeUsd: usdcSide ? usd6(usdcSide.amount) : null,
-      feesNative: first.feeXlm === null ? null : Number(first.feeXlm),
-      route: null,
+      volumeUsd: usdcSide ? usdcSide.amount : null,
+      feesNative,
+      // Per-hop venues (SDEX offers, classic pools, Soroban pools) come from
+      // trade effects and contract events, read by our own ingestion.
+      route: [],
       stellar: {
-        operations: legs.map((l) => ({ operationId: l.id, operationType: l.operationType, path: l.conversion!.path })),
+        operations: legs.map((l) => ({
+          operationId: l.id,
+          operationType: l.operationType,
+          path: l.contract ? null : (l.conversion?.path ?? null),
+          contract: l.contract ? { id: l.contract.id, function: l.contract.fn } : null,
+        })),
         memo: first.memo,
+        feeXlm: first.feeXlm,
+        feePaidBy: first.feePaidBy,
         explorerUrl: explorer.tx(first.txHash),
       },
     };
   });
-  const ats = rows.map((r) => r.at);
   return {
     data,
     meta: {
-      asOf,
+      asOf: ctx.asOf,
       hasMore: page.hasMore,
       usdBasis: 'usdc_face_value',
       ...(page.hasMore && page.nextCursor ? { nextCursor: page.nextCursor } : {}),
-      oldestAt: ats.length ? Math.min(...ats) : null,
-      stellar: { source: 'payments', preview: true },
+      ...(data.length ? { oldestAt: Math.min(...data.map((d) => d.at)) } : {}),
+      stellar: { source: 'horizon_payments', pageUnit: 'operations', route: 'not_in_preview', muxedId: ctx.muxedId, preview: true },
     },
   };
 }

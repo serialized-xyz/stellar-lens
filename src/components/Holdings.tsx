@@ -36,6 +36,30 @@ function PriceCell({ v }: { v: Valuation }) {
   );
 }
 
+/** A few words for the Value cell; the full reason is in the row details ("Why unpriced") and the tooltip. */
+export function shortReason(reason: string | null): string {
+  if (!reason) return '';
+  const rules: Array<[RegExp, string]> = [
+    [/mint facility/i, 'mint facility, not a market'],
+    [/market-depth check of this balance was not run/i, 'beyond pricing budget, depth not checked'],
+    [/prices at most \d+ holdings/i, 'beyond this preview\'s pricing budget'],
+    [/no SDEX or classic pool path/i, 'no SDEX or classic pool path'],
+    [/no path to USDC/i, 'no path to USDC'],
+    [/too thin/i, 'market too thin'],
+    [/absurd price/i, 'absurd price rejected'],
+    [/exceeds what SDEX and classic pools can absorb/i, 'balance exceeds market depth'],
+    [/Soroban-native/i, 'no classic market in this preview'],
+    [/underlying reserve unpriced/i, 'a pool reserve is unpriced'],
+    [/rate limited/i, 'rate limited, retry later'],
+    [/path finding failed|depth check failed/i, 'price lookup failed'],
+    [/pool (unavailable|not found)/i, 'pool unavailable'],
+    [/zero balance/i, 'zero balance'],
+  ];
+  for (const [re, label] of rules) if (re.test(reason)) return label;
+  const first = reason.split(/[:(;]/)[0].trim();
+  return first.length > 44 ? `${first.slice(0, 42)}...` : first;
+}
+
 function ValueCell({ v }: { v: Valuation }) {
   if (v.state === 'pending') return <Skeleton w={88} />;
   if (v.valueUsd === null)
@@ -43,7 +67,7 @@ function ValueCell({ v }: { v: Valuation }) {
       <span className="cell-stack">
         <span className="unpriced">unpriced</span>
         <span className="src reason" title={v.reason ?? ''}>
-          {v.reason}
+          {shortReason(v.reason)}
         </span>
       </span>
     );
@@ -208,8 +232,18 @@ function BalanceCell({ h }: { h: Holding }) {
   );
 }
 
+const verifyTone = (r: VerifyResult) => (r.status === 'match' ? 'ok' : r.status === 'changed' || r.status === 'behind' ? 'warn' : 'bad');
+const VERIFY_LABEL: Record<VerifyResult['status'], string> = {
+  match: 'Matches',
+  changed: 'Changed',
+  behind: 'RPC behind',
+  mismatch: 'Mismatch',
+  missing: 'Missing',
+  error: 'Error',
+};
+
 function VerifyPanel({ r }: { r: VerifyResult }) {
-  const tone = r.status === 'match' ? 'ok' : r.status === 'changed' ? 'warn' : 'bad';
+  const tone = verifyTone(r);
   return (
     <div className={`verify-panel verify-${tone}`}>
       <div className="verify-head">
@@ -221,9 +255,9 @@ function VerifyPanel({ r }: { r: VerifyResult }) {
           <thead>
             <tr>
               <th>Field</th>
-              <th>Shown (Horizon)</th>
-              <th>Ledger (Stellar RPC)</th>
-              <th />
+              <th>Horizon</th>
+              <th>Ledger (RPC)</th>
+              <th className="vt-icon" />
             </tr>
           </thead>
           <tbody>
@@ -232,14 +266,14 @@ function VerifyPanel({ r }: { r: VerifyResult }) {
                 <td>{c.field}</td>
                 <td className="mono">{c.shown}</td>
                 <td className="mono">{c.ledger}</td>
-                <td>{c.equal ? <Icon name="check" size={13} /> : <Icon name="alert" size={13} />}</td>
+                <td className="vt-icon">{c.equal ? <Icon name="check" size={13} /> : <Icon name="alert" size={13} />}</td>
               </tr>
             ))}
           </tbody>
         </table>
       ) : null}
       <div className="verify-meta">
-        getLedgerEntries{r.endpoint ? ` on ${new URL(r.endpoint).host}` : ''}
+        {r.method ?? 'Stellar RPC'}{r.endpoint ? ` on ${new URL(r.endpoint).host}` : ''}
         {r.ledger ? <> · latest ledger #{fmtInt(r.ledger)}</> : null}
         {r.entryLastModified ? <> · entry last modified in #{fmtInt(r.entryLastModified)}</> : null}
       </div>
@@ -342,7 +376,10 @@ function Details({ h, account }: { h: Holding; account: string }) {
                   </span>
                   <span className="cell-stack right">
                     <span className="mono">{fmtAmountShort(r.amount)}</span>
-                    <span className="src">{r.valueUsd === null ? 'unpriced' : fmtUsd(r.valueUsd)}</span>
+                    <span className="src">
+                      {r.valueUsd === null ? 'unpriced' : fmtUsd(r.valueUsd)}
+                      {r.valueUsd !== null && r.depthRatio !== null ? ` at depth (spot ${fmtUsd(r.valueUsd / r.depthRatio)})` : ''}
+                    </span>
                   </span>
                 </div>
               ))
@@ -381,29 +418,69 @@ function Details({ h, account }: { h: Holding; account: string }) {
   }
 }
 
-function HoldingRow({ h, account, totalUsd, autoOpen, autoVerify }: { h: Holding; account: string; totalUsd: number; autoOpen?: boolean; autoVerify?: boolean }) {
+/**
+ * Verify results, kept per account load (not per mount) so that switching
+ * tabs neither loses a result nor re-runs an automatic check.
+ */
+const verifyStore = new Map<string, VerifyResult>();
+const verifyKey = (account: string, asOf: number, key: string) => `${account}|${asOf}|${key}`;
+/** ?verify=1 checks at most this many rows automatically (one RPC call each). */
+const MAX_AUTO_VERIFY = 10;
+
+function HoldingRow({
+  h,
+  account,
+  asOf,
+  totalUsd,
+  pending,
+  autoOpen,
+  autoVerify,
+}: {
+  h: Holding;
+  account: string;
+  asOf: number;
+  totalUsd: number;
+  /** True while some holdings are still being priced: shares are not final yet. */
+  pending: boolean;
+  autoOpen?: boolean;
+  autoVerify?: boolean;
+}) {
+  const storeKey = verifyKey(account, asOf, h.key);
   const [open, setOpen] = useState(!!autoOpen);
   const [verifying, setVerifying] = useState(false);
-  const [result, setResult] = useState<VerifyResult | null>(null);
+  const [result, setResult] = useState<VerifyResult | null>(() => verifyStore.get(storeKey) ?? null);
   const share = h.valuation.valueUsd !== null && totalUsd > 0 ? (h.valuation.valueUsd / totalUsd) * 100 : null;
   const verify = async () => {
     setVerifying(true);
     setOpen(true);
     const r = await verifyHolding(h, account);
+    verifyStore.set(storeKey, r);
     setResult(r);
     setVerifying(false);
   };
   useEffect(() => {
-    if (autoOpen && autoVerify) void verify();
+    if (autoOpen && autoVerify && !verifyStore.has(storeKey)) void verify();
   }, []);
-  const vTone = result ? (result.status === 'match' ? 'ok' : result.status === 'changed' ? 'warn' : 'bad') : null;
+  const vTone = result ? verifyTone(result) : null;
+  const detailsId = `hd-${h.key.replace(/[^A-Za-z0-9]/g, '')}`;
   return (
     <div className={`hrow ${open ? 'open' : ''}`}>
-      <div className="hrow-main" onClick={() => setOpen(!open)} role="button" tabIndex={0} onKeyDown={(e) => (e.key === 'Enter' ? setOpen(!open) : undefined)}>
+      {/* The whole row toggles on click; the chevron button is the keyboard and screen-reader control. */}
+      <div className="hrow-main" onClick={() => setOpen(!open)}>
         <div className="c-asset">
-          <span className="chev">
+          <button
+            type="button"
+            className="chev"
+            aria-expanded={open}
+            aria-controls={detailsId}
+            aria-label={`${open ? 'Hide' : 'Show'} details of ${h.code}`}
+            onClick={(e) => {
+              e.stopPropagation();
+              setOpen(!open);
+            }}
+          >
             <Icon name="chevron" size={14} />
-          </span>
+          </button>
           <AssetCell h={h} />
         </div>
         <div className="c-bal">
@@ -416,7 +493,9 @@ function HoldingRow({ h, account, totalUsd, autoOpen, autoVerify }: { h: Holding
           <ValueCell v={h.valuation} />
         </div>
         <div className="c-share">
-          {share !== null ? (
+          {pending && h.valuation.state !== 'zero' ? (
+            <Skeleton w={44} />
+          ) : share !== null ? (
             <span className="share">
               <span className="mono">{fmtPct(share, share < 10 ? 2 : 1)}</span>
               <span className="share-bar">
@@ -436,15 +515,15 @@ function HoldingRow({ h, account, totalUsd, autoOpen, autoVerify }: { h: Holding
               void verify();
             }}
             disabled={verifying}
-            title="Read this entry straight from Stellar RPC (getLedgerEntries) and compare"
+            title={h.type === 'sep41' ? 'Simulate balance() again on Stellar RPC and compare' : 'Read this entry straight from Stellar RPC (getLedgerEntries) and compare'}
           >
             {verifying ? <Spinner size={11} /> : <Icon name={vTone === 'ok' ? 'check' : vTone ? 'alert' : 'shield'} size={13} />}
-            <span>{result ? (result.status === 'match' ? 'Matches' : result.status === 'changed' ? 'Changed' : result.status === 'mismatch' ? 'Mismatch' : 'Error') : 'Verify'}</span>
+            <span>{result ? VERIFY_LABEL[result.status] : 'Verify'}</span>
           </button>
         </div>
       </div>
       {open ? (
-        <div className="hrow-details">
+        <div className="hrow-details" id={detailsId}>
           {result ? <VerifyPanel r={result} /> : null}
           <Details h={h} account={account} />
         </div>
@@ -453,8 +532,25 @@ function HoldingRow({ h, account, totalUsd, autoOpen, autoVerify }: { h: Holding
   );
 }
 
+/** Reserve locked by empty trustlines: 1 subentry each (2 for a pool share), nothing for the account when sponsored. */
+function emptyReserveNote(empty: readonly Holding[], baseReserveStroops: bigint): string {
+  let locked = 0n;
+  let sponsored = 0;
+  for (const h of empty) {
+    const sponsor = h.type === 'credit' || h.type === 'pool_share' ? h.sponsor : null;
+    if (sponsor) sponsored++;
+    else locked += (h.type === 'pool_share' ? 2n : 1n) * baseReserveStroops;
+  }
+  const parts: string[] = ['zero balance'];
+  if (locked > 0n) parts.push(`${fromStroops(locked)} XLM of this account's reserve`);
+  if (sponsored) parts.push(`${sponsored === empty.length ? (sponsored > 1 ? 'all' : '') : sponsored} sponsored, reserve paid by the sponsor`.trim());
+  return parts.join('; ');
+}
+
 export function Holdings({ model, expand = [], autoVerify = false }: { model: PositionsModel; expand?: string[]; autoVerify?: boolean }) {
   const wants = (h: Holding) => expand.includes('ALL') || expand.includes(h.code.toUpperCase());
+  const autoVerifyKeys = new Set(model.holdings.filter(wants).slice(0, MAX_AUTO_VERIFY).map((h) => h.key));
+  const pending = model.summary.pending > 0;
   const [showEmpty, setShowEmpty] = useState(false);
   const account = model.account.id;
   const total = model.summary.totalValueUsd;
@@ -472,7 +568,16 @@ export function Holdings({ model, expand = [], autoVerify = false }: { model: Po
           <div className="c-verify">Ledger</div>
         </div>
         {model.holdings.map((h) => (
-          <HoldingRow key={h.key} h={h} account={account} totalUsd={total} autoOpen={wants(h)} autoVerify={autoVerify} />
+          <HoldingRow
+            key={h.key}
+            h={h}
+            account={account}
+            asOf={model.asOf}
+            totalUsd={total}
+            pending={pending}
+            autoOpen={wants(h)}
+            autoVerify={autoVerify && autoVerifyKeys.has(h.key)}
+          />
         ))}
       </div>
 
@@ -480,12 +585,12 @@ export function Holdings({ model, expand = [], autoVerify = false }: { model: Po
         <div className="empties">
           <button type="button" className="link-btn" onClick={() => setShowEmpty(!showEmpty)}>
             <Icon name="chevron" size={12} className={showEmpty ? 'rot' : ''} />
-            {model.emptyTrustlines.length} empty trustline{model.emptyTrustlines.length > 1 ? 's' : ''} (zero balance, each still locks 0.5 XLM of reserve)
+            {model.emptyTrustlines.length} empty trustline{model.emptyTrustlines.length > 1 ? 's' : ''} ({emptyReserveNote(model.emptyTrustlines, BigInt(model.ledger.base_reserve_in_stroops))})
           </button>
           {showEmpty ? (
             <div className="htable htable-empty">
               {model.emptyTrustlines.map((h) => (
-                <HoldingRow key={h.key} h={h} account={account} totalUsd={total} />
+                <HoldingRow key={h.key} h={h} account={account} asOf={model.asOf} totalUsd={total} pending={false} />
               ))}
             </div>
           ) : null}

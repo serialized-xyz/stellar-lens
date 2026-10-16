@@ -109,9 +109,9 @@ export function ExtLink({ href, children, className, title }: { href: string; ch
 }
 
 export function AccountLink({ id, head = 4, tail = 4, self }: { id: string; head?: number; tail?: number; self?: string }) {
-  if (self && id === self) return <span className="mono addr self">this account</span>;
+  if (self && id === self) return <span className="addr self">this account</span>;
   return (
-    <ExtLink href={explorer.account(id)} className="mono addr" title={id}>
+    <ExtLink href={id.startsWith('C') ? explorer.contract(id) : explorer.account(id)} className="mono addr" title={id}>
       {shortAddress(id, head, tail)}
     </ExtLink>
   );

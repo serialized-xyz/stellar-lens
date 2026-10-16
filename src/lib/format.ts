@@ -61,6 +61,10 @@ export function timeAgo(ms: number, now = Date.now()): string {
   return new Date(ms).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
 }
 
+export function fmtDate(ms: number): string {
+  return new Date(ms).toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' });
+}
+
 export function fmtDateTime(ms: number): string {
   return new Date(ms).toLocaleString('en-US', {
     year: 'numeric',

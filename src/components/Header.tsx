@@ -129,18 +129,22 @@ export function Header(props: {
         <div className="topbar-right">
           <LedgerTicker />
           {props.wallet ? (
-            <button type="button" className="btn btn-ghost btn-sm wallet-chip" onClick={props.onDisconnect} title="Disconnect (read-only session)">
+            <button
+              type="button"
+              className="btn btn-ghost btn-sm wallet-chip"
+              onClick={props.onDisconnect}
+              title={`Connected: ${props.wallet.address}${props.wallet.walletName ? ` (${props.wallet.walletName})` : ''}. Click to disconnect (read-only session).`}
+              aria-label="Disconnect wallet"
+            >
               <span className="wallet-dot" />
-              <span className="mono">{shortAddress(props.wallet.address)}</span>
+              <span className="mono wallet-addr">{shortAddress(props.wallet.address)}</span>
               {props.wallet.walletName ? <span className="wallet-name">{props.wallet.walletName}</span> : null}
               <Icon name="close" size={12} />
             </button>
           ) : (
-            <button type="button" className="btn btn-primary btn-sm" onClick={props.onConnect} disabled={props.connecting}>
+            <button type="button" className="btn btn-primary btn-sm btn-connect" onClick={props.onConnect} disabled={props.connecting} aria-label="Connect wallet" title="Connect a Stellar wallet (read-only)">
               {props.connecting ? <Spinner size={12} /> : <Icon name="wallet" size={14} />}
-              <span>
-                Connect<span className="hide-sm"> wallet</span>
-              </span>
+              <span className="connect-label">Connect wallet</span>
             </button>
           )}
         </div>

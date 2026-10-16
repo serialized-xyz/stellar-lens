@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import { loadOperations, loadPayments } from './data/activity.ts';
+import { getHistoryFrom, loadOperations, loadPayments } from './data/activity.ts';
+import type { ActivityPage } from './data/activity.ts';
 import { positionsJson, positionsPath, swapsJson, swapsPath, transfersJson, transfersPath } from './data/api.ts';
-import { DEMO_ACCOUNT, EXAMPLE_ACCOUNTS, SEP41_REGISTRY, explorer } from './data/config.ts';
+import { DEMO_ACCOUNT, EXAMPLE_ACCOUNTS, explorer } from './data/config.ts';
 import { fromStroops } from './data/amount.ts';
 import { describeError, invalidate } from './data/http.ts';
 import { AccountNotFoundError, loadPositions } from './data/positions.ts';
@@ -15,7 +16,7 @@ import type { Tab } from './lib/url.ts';
 import { connectWallet, disconnectWallet } from './lib/wallet.ts';
 import type { Connected } from './lib/wallet.ts';
 import { ActivityList, emptyFeed } from './components/Activity.tsx';
-import type { Feed, FeedState } from './components/Activity.tsx';
+import type { Feed, FeedPage, FeedState } from './components/Activity.tsx';
 import { ApiDrawer } from './components/ApiDrawer.tsx';
 import type { Endpoint, EndpointView } from './components/ApiDrawer.tsx';
 import { Header } from './components/Header.tsx';
@@ -52,6 +53,7 @@ export function App() {
   const [connecting, setConnecting] = useState(false);
   const [walletError, setWalletError] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
+  const [historyFrom, setHistoryFrom] = useState<number | null>(null);
   const loadId = useRef(0);
 
   useEffect(() => {
@@ -88,14 +90,17 @@ export function App() {
         if (loadId.current === id)
           setPositions({ status: 'error', error: err instanceof Error ? err.message : describeError(err), notFound: err instanceof AccountNotFoundError });
       });
-    loadPayments(target.account)
+    loadPayments(target.account, null, 50, target.muxedId)
       .then((p) => {
-        if (loadId.current === id)
-          setFeeds((f) => ({ ...f, payments: { rows: p.rows, cursor: p.nextCursor, hasMore: p.hasMore, loading: false, loaded: true, error: null } }));
+        if (loadId.current === id) setFeeds((f) => ({ ...f, payments: firstPage(p) }));
       })
       .catch((err) => {
         if (loadId.current === id) setFeeds((f) => ({ ...f, payments: { ...f.payments, loading: false, loaded: true, error: describeError(err) } }));
       });
+    // Where Horizon's retained history starts (one cached lookup per session).
+    getHistoryFrom()
+      .then(setHistoryFrom)
+      .catch(() => setHistoryFrom(null));
   }, [target, reloadKey]);
 
   const loadFeed = useCallback(
@@ -106,20 +111,13 @@ export function App() {
       if (current.loading) return;
       setFeeds((f) => ({ ...f, [which]: { ...f[which], loading: true, error: null } }));
       const fn = which === 'payments' ? loadPayments : loadOperations;
-      fn(target.account, more ? current.cursor : null)
+      fn(target.account, more ? current.cursor : null, 50, target.muxedId)
         .then((p) => {
           if (loadId.current !== id) return;
-          setFeeds((f) => ({
-            ...f,
-            [which]: {
-              rows: more ? [...f[which].rows, ...p.rows] : p.rows,
-              cursor: p.nextCursor,
-              hasMore: p.hasMore,
-              loading: false,
-              loaded: true,
-              error: null,
-            },
-          }));
+          setFeeds((f) => {
+            const next = firstPage(p);
+            return { ...f, [which]: more ? { ...next, rows: [...f[which].rows, ...p.rows] } : next };
+          });
         })
         .catch((err) => {
           if (loadId.current === id) setFeeds((f) => ({ ...f, [which]: { ...f[which], loading: false, loaded: true, error: describeError(err) } }));
@@ -160,7 +158,7 @@ export function App() {
       lookUp(w.address);
     } catch (err) {
       const msg = describeError(err);
-      // Closing the modal is not an error worth showing.
+      // Closing the modal ("The user closed the modal.") is not an error worth showing.
       if (!/clos|cancel|dismiss|reject/i.test(msg)) setWalletError(`Wallet connection failed: ${msg}`);
     } finally {
       setConnecting(false);
@@ -179,39 +177,51 @@ export function App() {
   };
 
   const model = positions.status === 'ready' || positions.status === 'loading' ? positions.model : null;
-  const asOf = model?.asOf ?? Date.now();
+  const positionsError = positions.status === 'error' ? positions.error : null;
 
   const views: EndpointView[] = useMemo(() => {
-    const wallet = target?.account ?? 'G...';
+    const base = target?.account ?? 'G...';
+    // Transfers and swaps are relative to the address entered (a muxed M address included).
+    const wallet = target?.input ?? 'G...';
     const pay = feeds.payments;
-    const page = { hasMore: pay.hasMore, nextCursor: pay.cursor };
+    // The drawer shows ONE page, as the API serves it: the last page read.
+    const last: FeedPage | null = pay.lastPage;
+    const page = { hasMore: last?.hasMore ?? false, nextCursor: last?.nextCursor ?? null };
+    const ctx = { wallet: base, muxedId: target?.muxedId ?? null, asOf: last?.fetchedAt ?? 0, historyFrom };
+    const payError = positionsError ?? pay.error;
     return [
       {
         id: 'positions',
         label: '/v1/wallet/positions',
-        path: positionsPath(wallet),
+        short: '/positions',
+        path: positionsPath(base),
         json: model?.complete ? positionsJson(model) : null,
         ready: !!model?.complete,
-        note: 'Same envelope and row fields as on EVM and Solana. Trade-derived fields (entry, exit, PnL, buys, sells) are null in this preview: they come from our own ingestion. Stellar specifics sit under "stellar".',
+        error: positionsError,
+        note: 'Same envelope and row fields as on EVM and Solana. Trade-derived fields (entry, exit, PnL, buys, sells) are null on position rows in this preview, and meta.stellar.tradeHistory says why: they come from our own ingestion. Stellar specifics sit under "stellar".',
       },
       {
         id: 'transfers',
         label: '/v1/wallet/transfers',
-        path: transfersPath(wallet),
-        json: pay.loaded && !pay.error ? transfersJson(pay.rows, page, asOf) : null,
-        ready: pay.loaded && !pay.error,
-        note: 'Token movements in and out, newest first, one row per asset moved. amountUsd is only filled for Circle USDC (face value): historical prices come with our own ingestion. A path payment to another account is a transfer carrying stellar.conversion.',
+        short: '/transfers',
+        path: transfersPath(wallet, last?.requestCursor ?? null),
+        json: last && !pay.error ? transfersJson(last.rows, page, ctx) : null,
+        ready: !!last && !pay.error,
+        error: payError,
+        note: 'Token movements in and out of the account, newest first, one row per asset moved; a transaction that only swapped adds none. amountUsd is only filled for Circle USDC (face value): historical prices come with our own ingestion. A page covers 50 Horizon operations.',
       },
       {
         id: 'swaps',
         label: '/v1/wallet/swaps',
-        path: swapsPath(wallet),
-        json: pay.loaded && !pay.error ? swapsJson(pay.rows, page, asOf) : null,
-        ready: pay.loaded && !pay.error,
-        note: 'The account\'s own path payments (source and destination both this account), one row per transaction. route is null: per-hop venues are read from trade effects by our own ingestion.',
+        short: '/swaps',
+        path: swapsPath(wallet, last?.requestCursor ?? null),
+        json: last && !pay.error ? swapsJson(last.rows, page, ctx) : null,
+        ready: !!last && !pay.error,
+        error: payError,
+        note: "The account's own swaps, one row per transaction: path payments from and to the account, and Soroban contract calls that took one asset and paid another. route is empty: per-hop venues come from trade effects and contract events, read by our own ingestion.",
       },
     ];
-  }, [target, model, feeds.payments, asOf]);
+  }, [target, model, feeds.payments, historyFrom, positionsError]);
 
   return (
     <div className="app">
@@ -234,10 +244,13 @@ export function App() {
             <AccountHeader target={target} positions={positions} wallet={wallet} onRefresh={refresh} />
             {positions.status === 'error' ? (
               <div className="error-box big">
-                <Icon name="alert" size={16} /> {positions.error}
+                <Icon name="alert" size={16} />
+                <span className="error-text">{positions.error}
                 {positions.notFound ? (
-                  <span className="muted"> An address only exists on the ledger once it has received at least 1 XLM.</span>
-                ) : (
+                  <span className="muted"> An account exists on the ledger only once it has been created (funded with at least 1 XLM, or sponsored).</span>
+                ) : null}
+                </span>
+                {positions.notFound ? null : (
                   <button type="button" className="btn btn-ghost btn-sm" onClick={refresh}>
                     Retry
                   </button>
@@ -246,14 +259,19 @@ export function App() {
             ) : (
               <>
                 <div className="tabs-bar">
-                  <div className="tabs" role="tablist">
-                    <button type="button" role="tab" className={tab === 'holdings' ? 'on' : ''} onClick={() => setTab('holdings')}>
+                  <div className="tabs" role="tablist" aria-label="Account views">
+                    <button type="button" role="tab" aria-selected={tab === 'holdings'} className={tab === 'holdings' ? 'on' : ''} onClick={() => setTab('holdings')}>
                       Holdings
                       {model ? <span className="count">{model.holdings.length}</span> : null}
                     </button>
-                    <button type="button" role="tab" className={tab === 'activity' ? 'on' : ''} onClick={() => setTab('activity')}>
+                    <button type="button" role="tab" aria-selected={tab === 'activity'} className={tab === 'activity' ? 'on' : ''} onClick={() => setTab('activity')}>
                       Activity
-                      {feeds.payments.loaded ? <span className="count">{feeds.payments.rows.length}{feeds.payments.hasMore ? '+' : ''}</span> : null}
+                      {feeds[feed].loaded ? (
+                        <span className="count">
+                          {feeds[feed].rows.length}
+                          {feeds[feed].hasMore ? '+' : ''}
+                        </span>
+                      ) : null}
                     </button>
                   </div>
                   <button type="button" className="btn btn-api" onClick={() => setApiOpen(true)}>
@@ -273,6 +291,7 @@ export function App() {
                     muxedId={target.muxedId}
                     feed={feed}
                     state={feeds[feed]}
+                    historyFrom={historyFrom}
                     onFeed={(f) => setFeed(f)}
                     onMore={() => loadFeed(feed, true)}
                   />
@@ -303,7 +322,7 @@ function SearchForm(props: { query: string; setQuery: (s: string) => void; onLoo
         className="search-input mono"
         value={props.query}
         onChange={(e) => props.setQuery(e.target.value)}
-        placeholder="Stellar address: G... or muxed M..."
+        placeholder="G... or M... address"
         spellcheck={false}
         autoComplete="off"
         autoCapitalize="characters"
@@ -365,7 +384,7 @@ function Hero(props: {
         </div>
         <div className="hero-fine">
           <Icon name="shield" size={13} />
-          Read-only. Lens only reads your public key from the wallet and never asks you to sign anything.
+          Read-only. Lens only reads your public key from the wallet and never asks you to sign a transaction.
         </div>
       </div>
 
@@ -383,7 +402,7 @@ function Hero(props: {
         <div className="feature">
           <div className="feature-k">Activity</div>
           <div className="feature-t">/v1/wallet/transfers, /swaps</div>
-          <p>Payments, path payments as one swap row, account creation and merges, pool deposits and withdrawals, memos, with cursor pagination.</p>
+          <p>Payments, path payments and contract swaps as one swap row, account creation and merges, pool deposits and withdrawals, memos, with cursor pagination.</p>
         </div>
         <div className="feature">
           <div className="feature-k">Verify</div>
@@ -424,6 +443,7 @@ function AccountHeader(props: { target: ParsedAddress; positions: PositionsState
   const reserves = native && native.type === 'native' ? native.reserves : null;
   const label = KNOWN_LABELS[target.account];
   const loading = positions.status === 'loading';
+  const failed = positions.status === 'error';
   return (
     <section className="account">
       <div className="account-top">
@@ -459,7 +479,7 @@ function AccountHeader(props: { target: ParsedAddress; positions: PositionsState
         </div>
         <div className="account-actions">
           <span className="asof">
-            {m ? (
+            {failed ? null : m ? (
               <>
                 read at ledger{' '}
                 <ExtLink href={explorer.ledger(m.ledger.sequence)} className="mono">
@@ -475,6 +495,7 @@ function AccountHeader(props: { target: ParsedAddress; positions: PositionsState
           </button>
         </div>
       </div>
+      {failed ? null : (
       <div className="kpis">
         <Kpi
           label="Portfolio value"
@@ -495,14 +516,15 @@ function AccountHeader(props: { target: ParsedAddress; positions: PositionsState
         <Kpi label="XLM balance" sub={m && native?.valuation.valueUsd ? fmtUsd(native.valuation.valueUsd) : null}>
           {reserves ? <span className="mono">{fmtAmountShort(fromStroops(reserves.total))}</span> : <Skeleton w={110} h={18} />}
         </Kpi>
-        <Kpi label="Reserved" sub={reserves ? `${reserves.subentryCount} subentries${reserves.numSponsoring ? `, sponsoring ${fmtInt(reserves.numSponsoring)}` : ''}${reserves.numSponsored ? `, ${reserves.numSponsored} sponsored` : ''}` : null}>
+        <Kpi label="Reserved XLM" sub={reserves ? `${reserves.subentryCount} subentries${reserves.numSponsoring ? `, sponsoring ${fmtInt(reserves.numSponsoring)}` : ''}${reserves.numSponsored ? `, ${reserves.numSponsored} sponsored` : ''}` : null}>
           {reserves ? <span className="mono">{fmtAmountShort(fromStroops(reserves.reserved))}</span> : <Skeleton w={80} h={18} />}
         </Kpi>
         <Kpi label="Spendable XLM">{reserves ? <span className="mono">{fmtAmountShort(fromStroops(reserves.spendable))}</span> : <Skeleton w={110} h={18} />}</Kpi>
-        <Kpi label="Trustlines" sub={m ? `${m.emptyTrustlines.length} empty, ${SEP41_REGISTRY.length} SEP-41 checked` : null}>
+        <Kpi label="Trustlines" sub={m ? trustlineSub(m) : null}>
           {m ? <span className="mono">{m.holdings.filter((h) => h.type === 'credit' || h.type === 'pool_share').length + m.emptyTrustlines.length}</span> : <Skeleton w={30} h={18} />}
         </Kpi>
       </div>
+      )}
       {m?.errors.length
         ? m.errors.map((e) => (
             <div className="banner banner-warn" key={e}>
@@ -517,6 +539,19 @@ function AccountHeader(props: { target: ParsedAddress; positions: PositionsState
       ) : null}
     </section>
   );
+}
+
+function trustlineSub(m: PositionsModel): string {
+  const pools = [...m.holdings, ...m.emptyTrustlines].filter((h) => h.type === 'pool_share').length;
+  const parts = [`${m.emptyTrustlines.length} empty`];
+  if (pools) parts.push(`${pools} pool share${pools > 1 ? 's' : ''}`);
+  return parts.join(', ');
+}
+
+/** Feed state after reading a page (the first one, or a "load more" page whose rows the caller appends). */
+function firstPage(p: ActivityPage): FeedState {
+  const page: FeedPage = { rows: p.rows, requestCursor: p.requestCursor, nextCursor: p.nextCursor, hasMore: p.hasMore, fetchedAt: p.fetchedAt };
+  return { rows: p.rows, cursor: p.nextCursor, hasMore: p.hasMore, loading: false, loaded: true, error: null, lastPage: page };
 }
 
 function Footer() {

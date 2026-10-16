@@ -215,5 +215,8 @@ export function describeError(err: unknown): string {
     if (err.name === 'TypeError') return 'network error (blocked or unreachable)';
     return err.message;
   }
+  // Some libraries (the wallet kit among them) reject with a plain object
+  // such as { code: -1, message: "The user closed the modal." }.
+  if (err && typeof err === 'object' && typeof (err as { message?: unknown }).message === 'string') return (err as { message: string }).message;
   return String(err);
 }

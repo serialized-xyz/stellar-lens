@@ -6,9 +6,9 @@ import { LIMITS, SEP41_REGISTRY, USDC_ID, explorer } from './config.ts';
 import type { Sep41RegistryEntry } from './config.ts';
 import { fromStroops, toNumber, toStroops, trimAmount } from './amount.ts';
 import { getAccount, getLatestLedger, getLiquidityPool } from './horizon.ts';
-import type { HorizonAccount, HorizonBalanceCredit, HorizonBalancePool, HorizonLedger, HorizonLiquidityPool } from './horizon.ts';
+import type { HorizonAccount, HorizonBalanceCredit, HorizonLedger, HorizonLiquidityPool } from './horizon.ts';
 import { describeError } from './http.ts';
-import { getXlmUsd, priceAsset, valueAtDepth } from './prices.ts';
+import { depthCheckNeeded, getXlmUsd, priceAsset, valueAtDepth } from './prices.ts';
 import type { PriceResult, PriceSource } from './prices.ts';
 import { assetCode, assetIssuer, readSep41, sacContractId } from './stellar.ts';
 import type { AssetId, ParsedAddress } from './stellar.ts';
@@ -133,16 +133,23 @@ export interface PoolReserveShare {
   /** The account's share of that reserve. */
   amount: string;
   priceUsd: number | null;
+  /** Value of the account's share of this reserve at market depth. */
   valueUsd: number | null;
+  /** Depth value divided by spot value, when below 1. */
+  depthRatio: number | null;
 }
 
+/**
+ * A CAP-38 pool share. Its trustline carries no authorization flags of its
+ * own (authorization follows the trustlines of the two pool assets), so none
+ * are kept here: Horizon reports is_authorized false for every one of them.
+ */
 export interface PoolShareHolding extends HoldingBase {
   type: 'pool_share';
   poolId: string;
   stroops: bigint;
   limit: string;
   sponsor: string | null;
-  flags: TrustlineFlags;
   pool: {
     feeBp: number;
     totalShares: string;
@@ -210,7 +217,7 @@ export class AccountNotFoundError extends Error {
 
 const KNOWN_NAMES: Record<string, string> = { [USDC_ID]: 'USD Coin' };
 
-function flagsOf(b: HorizonBalanceCredit | HorizonBalancePool): TrustlineFlags {
+function flagsOf(b: HorizonBalanceCredit): TrustlineFlags {
   return {
     authorized: b.is_authorized ?? false,
     authorizedToMaintainLiabilities: b.is_authorized_to_maintain_liabilities ?? false,
@@ -259,7 +266,6 @@ export function buildBaseHoldings(account: HorizonAccount, ledger: HorizonLedger
         stroops,
         limit: trimAmount(b.limit),
         sponsor: b.sponsor ?? null,
-        flags: flagsOf(b),
         lastModifiedLedger: b.last_modified_ledger,
         valuation: pendingValuation(),
         explorerUrl: explorer.pool(b.liquidity_pool_id),
@@ -397,32 +403,44 @@ export async function loadPositions(address: ParsedAddress, opts: LoadOptions = 
 
   const xlmP = getXlmUsd();
 
-  // Gentle-use budget: price the first N holdings (USDC, then pool shares,
-  // then ledger order), verify the first M trustlines; every row left out
-  // says so.
+  // One price per asset per load, shared by trustline rows and pool reserves.
+  const priceMemo = new Map<AssetId, Promise<PriceResult>>();
+  const priceOf = async (asset: AssetId): Promise<PriceResult> => {
+    const xlm = await xlmP;
+    let p = priceMemo.get(asset);
+    if (!p) {
+      p = priceAsset(asset, xlm);
+      priceMemo.set(asset, p);
+    }
+    return p;
+  };
+
+  // Gentle-use budget: price the first N holdings, ranked USDC, then pool
+  // shares, then real balances (largest first), then dust of a few stroops
+  // (often NFT-like tokens); verify the first M trustlines. A row beyond the
+  // budget reuses a price already computed on this page, else says why it is
+  // unpriced.
+  const DUST_STROOPS = 10n;
+  const stroopsOf = (h: Holding): bigint => ('stroops' in h ? h.stroops : 0n);
+  const rank = (h: Holding) =>
+    h.type === 'credit' && h.assetId === USDC_ID ? 0 : h.type === 'pool_share' ? 1 : stroopsOf(h) > DUST_STROOPS ? 2 : 3;
   const priceable = holdings.filter((h) => h.type !== 'native');
-  const rank = (h: Holding) => (h.type === 'credit' && h.assetId === USDC_ID ? 0 : h.type === 'pool_share' ? 1 : 2);
-  const priority = [...priceable].sort((a, b) => rank(a) - rank(b));
+  const priority = [...priceable].sort((a, b) => {
+    const r = rank(a) - rank(b);
+    if (r !== 0) return r;
+    const sa = stroopsOf(a);
+    const sb = stroopsOf(b);
+    return sb > sa ? 1 : sb < sa ? -1 : 0;
+  });
   const toPrice = new Set(priority.slice(0, LIMITS.maxPricedHoldings).map((h) => h.key));
   const verifiable = [...priority.filter((h) => toPrice.has(h.key)), ...holdings.filter((h) => !toPrice.has(h.key)), ...empty].filter(
     (h) => h.type === 'credit',
   );
   const toVerify = new Set(verifiable.slice(0, LIMITS.maxVerifiedTrustlines).map((h) => h.key));
-  const skippedPricing = priceable.length - toPrice.size;
-  if (skippedPricing > 0)
-    model.errors.push(
-      `${skippedPricing} holdings left unpriced: this preview prices at most ${LIMITS.maxPricedHoldings} holdings per account to stay gentle with public Horizon.`,
-    );
 
-  // Prices and depth values.
+  // Prices and depth values of the holdings within the budget.
   const pricing = holdings.map(async (h) => {
-    if (h.type !== 'native' && !toPrice.has(h.key)) {
-      replace(h.key, (x) => ({
-        ...x,
-        valuation: unpriced(`not priced: this preview prices at most ${LIMITS.maxPricedHoldings} holdings per account (gentle use of public Horizon)`),
-      }));
-      return;
-    }
+    if (h.type !== 'native' && !toPrice.has(h.key)) return; // priced (or not) once the budgeted rows are done
     const xlm = await xlmP;
     model.xlm = xlm;
     if (h.type === 'native') {
@@ -433,7 +451,7 @@ export async function loadPositions(address: ParsedAddress, opts: LoadOptions = 
           : unpriced(xlm.reason),
       }));
     } else if (h.type === 'credit') {
-      const p = await priceAsset(h.assetId, xlm);
+      const p = await priceOf(h.assetId);
       if (!p.ok) {
         replace(h.key, (x) => ({ ...x, valuation: unpriced(p.reason) }));
       } else {
@@ -447,10 +465,55 @@ export async function loadPositions(address: ParsedAddress, opts: LoadOptions = 
         }));
       }
     } else if (h.type === 'pool_share') {
-      await valuePoolShare(h, xlm, replace);
+      await valuePoolShare(h, xlm, priceOf, replace);
     }
     emit();
   });
+
+  // Holdings beyond the budget: no new request. A price already computed on
+  // this page (for another row or a pool reserve) is reused when the balance
+  // is small enough not to need a depth check; anything else is unpriced,
+  // with the reason.
+  const beyondBudget = (async () => {
+    await Promise.allSettled(pricing);
+    let left = 0;
+    for (const h of holdings) {
+      if (h.type === 'native' || toPrice.has(h.key)) continue;
+      const known = h.type === 'credit' ? priceMemo.get(h.assetId) : undefined;
+      const p = known ? await known : null;
+      if (h.type === 'credit' && p?.ok) {
+        const amount = toNumber(h.stroops);
+        if (!depthCheckNeeded(amount, p.price)) {
+          replace(h.key, (x) => ({
+            ...x,
+            valuation: priced(p.price.usd, amount * p.price.usd, p.price.source, `${p.price.detail} (price already computed for another row of this account)`),
+          }));
+          continue;
+        }
+        replace(h.key, (x) => ({
+          ...x,
+          valuation: unpriced(
+            `not priced: beyond this preview's budget of ${LIMITS.maxPricedHoldings} priced holdings; the unit price is known from another row, but the market-depth check of this balance was not run`,
+            p.price.usd,
+            p.price.source,
+            p.price.detail,
+          ),
+        }));
+        left++;
+        continue;
+      }
+      replace(h.key, (x) => ({
+        ...x,
+        valuation: unpriced(`not priced: this preview prices at most ${LIMITS.maxPricedHoldings} holdings per account (gentle use of public Horizon)`),
+      }));
+      left++;
+    }
+    if (left > 0)
+      model.errors.push(
+        `${left} holdings left unpriced: this preview prices at most ${LIMITS.maxPricedHoldings} holdings per account to stay gentle with public Horizon.`,
+      );
+    emit();
+  })();
 
   // SEP-1 verification of the trustline assets within the budget (empty ones included).
   const verifying = [...holdings, ...empty].map(async (h) => {
@@ -502,7 +565,7 @@ export async function loadPositions(address: ParsedAddress, opts: LoadOptions = 
         emit();
       });
 
-  const settled = await Promise.allSettled([...pricing, ...verifying, ...sep41]);
+  const settled = await Promise.allSettled([...pricing, beyondBudget, ...verifying, ...sep41]);
   for (const s of settled) if (s.status === 'rejected') model.errors.push(describeError(s.reason));
   // Anything still pending after every task settled failed unexpectedly: say so.
   model.holdings = model.holdings.map((h) =>
@@ -517,6 +580,7 @@ export async function loadPositions(address: ParsedAddress, opts: LoadOptions = 
 async function valuePoolShare(
   h: PoolShareHolding,
   xlm: PriceResult,
+  priceOf: (asset: AssetId) => Promise<PriceResult>,
   replace: (key: string, patch: (h: Holding) => Holding) => void,
 ): Promise<void> {
   let pool: HorizonLiquidityPool | null;
@@ -535,6 +599,7 @@ async function valuePoolShare(
   const reserves: PoolReserveShare[] = [];
   for (const r of pool.reserves) {
     const poolStroops = toStroops(r.amount);
+    // Rounded down, as the protocol computes a withdrawal.
     const mine = totalShares > 0n ? (poolStroops * share) / totalShares : 0n;
     reserves.push({
       assetId: r.asset,
@@ -544,6 +609,7 @@ async function valuePoolShare(
       amount: fromStroops(mine),
       priceUsd: null,
       valueUsd: null,
+      depthRatio: null,
     });
   }
   const sharePercent = totalShares > 0n ? (Number(share) / Number(totalShares)) * 100 : 0;
@@ -558,25 +624,36 @@ async function valuePoolShare(
   const name = `${reserves.map((r) => r.code).join('/')} pool share`;
   replace(h.key, (x) => ({ ...x, name, pool: poolInfo }));
 
-  const prices = await Promise.all(reserves.map((r) => priceAsset(r.assetId, xlm)));
-  const valued = reserves.map((r, i) => {
-    const p = prices[i];
-    return p.ok ? { ...r, priceUsd: p.price.usd, valueUsd: toNumber(r.amount) * p.price.usd } : r;
-  });
-  const missing = prices.map((p, i) => (p.ok ? null : `${reserves[i].code}: ${p.reason}`)).filter((x) => x !== null);
-  const value = valued.reduce((s, r) => s + (r.valueUsd ?? 0), 0);
+  // Each reserve is valued as a trustline holding is: at market depth, the
+  // proceeds of selling it now through the best SDEX/AMM path.
+  const valued = await Promise.all(
+    reserves.map(async (r): Promise<{ r: PoolReserveShare; spot: number; reason: string | null }> => {
+      const p = await priceOf(r.assetId);
+      if (!p.ok) return { r, spot: 0, reason: `${r.code}: ${p.reason}` };
+      const amount = toNumber(r.amount);
+      const spot = amount * p.price.usd;
+      const depth = await valueAtDepth(r.assetId, amount, p.price, xlm);
+      if (!depth.ok) return { r: { ...r, priceUsd: p.price.usd }, spot, reason: `${r.code}: ${depth.reason}` };
+      return { r: { ...r, priceUsd: p.price.usd, valueUsd: depth.usd, depthRatio: depth.ratio < 0.999 ? depth.ratio : null }, spot, reason: null };
+    }),
+  );
+  const missing = valued.map((v) => v.reason).filter((x): x is string => x !== null);
+  const value = valued.reduce((s, v) => s + (v.r.valueUsd ?? 0), 0);
+  const spot = valued.reduce((s, v) => s + v.spot, 0);
+  const ratio = spot > 0 ? value / spot : 1;
   const shares = toNumber(h.stroops);
   replace(h.key, (x) => ({
     ...x,
     name,
-    pool: { ...poolInfo, reserves: valued },
+    pool: { ...poolInfo, reserves: valued.map((v) => v.r) },
     valuation: missing.length
       ? unpriced(`underlying reserve unpriced (${missing.join('; ')})`)
       : priced(
-          shares > 0 ? value / shares : 0,
+          shares > 0 ? spot / shares : 0,
           value,
           'underlying_reserves',
-          `your ${sharePercent.toPrecision(3)}% of the pool reserves, each at its market price`,
+          `your ${sharePercent.toPrecision(3)}% of the pool reserves, each valued at market depth (proceeds of selling it now through the best SDEX/AMM path)`,
+          ratio < 0.999 ? ratio : null,
         ),
   }));
 }

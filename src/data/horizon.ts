@@ -100,6 +100,25 @@ export interface HorizonTransaction {
   successful: boolean;
   operation_count: number;
   source_account: string;
+  /** Account that paid the fee: differs from source_account for fee-bump transactions and channel setups. */
+  fee_account?: string;
+}
+
+/** Effect record (only the fields this preview reads). */
+export interface HorizonEffect {
+  id: string;
+  type: string;
+  account?: string;
+  amount?: string;
+  asset_type?: string;
+  asset_code?: string;
+  asset_issuer?: string;
+}
+
+/** Horizon root document: the ledger range this instance serves history for. */
+export interface HorizonRoot {
+  history_latest_ledger: number;
+  history_elder_ledger: number;
 }
 
 export interface HorizonAssetBalanceChange {
@@ -207,6 +226,21 @@ export async function getLatestLedger(): Promise<HorizonLedger> {
   return rec;
 }
 
+/** Ledger range of this Horizon instance (public Horizon keeps about one year of history). */
+export function getRoot(): Promise<HorizonRoot> {
+  return get<HorizonRoot>('/', 10 * 60_000);
+}
+
+/** One closed ledger: immutable, cached for a day. */
+export function getLedger(seq: number): Promise<HorizonLedger> {
+  return get<HorizonLedger>(`/ledgers/${seq}`, 24 * 3_600_000);
+}
+
+/** Effects of one operation: immutable once closed, cached for an hour. */
+export function getOperationEffects(operationId: string): Promise<HorizonPage<HorizonEffect>> {
+  return get<HorizonPage<HorizonEffect>>(`/operations/${operationId}/effects?limit=20`, 3_600_000);
+}
+
 export function getLiquidityPool(id: string): Promise<HorizonLiquidityPool | null> {
   return get<HorizonLiquidityPool | null>(`/liquidity_pools/${id}`, 30_000, [404]);
 }
@@ -275,6 +309,12 @@ export function findLiquidityPools(reserves: readonly string[]) {
     `/liquidity_pools?reserves=${encodeURIComponent(reserves.join(','))}&limit=5`,
     60_000,
   );
+}
+
+/** Network-wide payments, newest first (used by the live test to find merges and contract swaps at run time). */
+export function getNetworkPayments(cursor?: string | null, limit = 200) {
+  const c = cursor ? `&cursor=${encodeURIComponent(cursor)}` : '';
+  return get<HorizonPage<HorizonOperation>>(`/payments?order=desc&limit=${limit}&join=transactions${c}`, 15_000);
 }
 
 /** Accounts holding shares of a pool (used by the live test to find an LP account). */

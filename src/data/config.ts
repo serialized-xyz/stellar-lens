@@ -27,25 +27,27 @@ export const USDC_ID = `USDC:${USDC_ISSUER}`;
 export const STELLAR_DECIMALS = 7;
 
 /**
- * Demo account: Circle's USDC and EURC treasury account on Stellar mainnet.
- * Labelled "Centre" (centre.io, the USDC consortium now part of Circle) in the
- * moderated stellar.expert directory. It holds XLM, USDC, EURC and legacy
- * EUROC, and receives USDC mints as path payments from Circle's account
- * GDEWOLMO... which is itself listed in centre.io/.well-known/stellar.toml.
+ * Demo account: a USDC account of Centre (centre.io, the USDC consortium now
+ * part of Circle) on Stellar mainnet. The moderated stellar.expert directory
+ * labels it "Centre" (tag: anchor); centre.io's stellar.toml does not list it
+ * (it lists the USDC issuer and GDEWOLMO...). It holds XLM, USDC, EURC and
+ * legacy EUROC, receives USDC mints as path payments with memo "mint" from
+ * GDEWOLMO..., and its activity looks operational (payouts, deposits with
+ * memos, a 1 USDC self-payment every few minutes).
  */
 export const DEMO_ACCOUNT = {
   address: 'GAFK7XFZHMLSNV7OJTBO7BAIZA66X6QIBV5RMZZYXK4Q7ZSO52J5C3WQ',
-  label: 'Circle treasury account',
-  source: 'stellar.expert directory: "Centre", centre.io',
+  label: 'Centre (Circle) USDC account',
+  source: 'stellar.expert directory label "Centre" (centre.io, tag: anchor)',
 } as const;
 
 /** Other organisations' accounts offered as examples (labels from the moderated stellar.expert directory). */
 export const EXAMPLE_ACCOUNTS: ReadonlyArray<{ address: string; label: string; why: string; source: string }> = [
   {
     address: 'GC3XQ7GM6XO36MORCS2SRHHEC2G52FMO4FHPLKUG76EKMTF73ZRH4HWR',
-    label: 'DECAF wallet operator',
+    label: 'Decaf',
     why: '36 trustlines, verified assets, clawback flags, and the reserves of every account it sponsors',
-    source: 'stellar.expert directory: "Decaf", decaf.so',
+    source: 'stellar.expert directory label "Decaf" (decaf.so, tag: custodian)',
   },
 ];
 

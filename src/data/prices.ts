@@ -49,7 +49,8 @@ async function computeXlmUsd(): Promise<PriceResult> {
   try {
     const [book, pools] = await Promise.all([
       getOrderBook('native', USDC_ID, 5),
-      findLiquidityPools(['native', USDC_ID]).catch(() => null),
+      // The cross-check is a second opinion: when it cannot run, the trace says so.
+      findLiquidityPools(['native', USDC_ID]).catch((err: unknown) => ({ unavailable: describeError(err) })),
     ]);
     const bid = Number(book.bids[0]?.price);
     const ask = Number(book.asks[0]?.price);
@@ -60,11 +61,14 @@ async function computeXlmUsd(): Promise<PriceResult> {
     if (spread > XLM_MAX_SPREAD) return { ok: false, reason: `XLM/USDC spread ${(spread * 100).toFixed(2)}% is too wide` };
     if (mid < XLM_MIN_USD || mid > XLM_MAX_USD) return { ok: false, reason: `XLM/USDC mid ${mid} outside sanity bounds` };
     let detail = `SDEX order book XLM/USDC: bid ${fmtPrice(bid)}, ask ${fmtPrice(ask)}, mid ${fmtPrice(mid)}`;
-    const pool = pools?._embedded.records[0];
+    const pool = 'unavailable' in pools ? null : pools._embedded.records[0];
+    if ('unavailable' in pools) detail += `; classic pool cross-check unavailable (${pools.unavailable})`;
+    else if (!pool) detail += '; classic pool cross-check not run (no XLM/USDC classic pool found)';
     if (pool) {
       const xlm = Number(pool.reserves.find((r) => r.asset === 'native')?.amount);
       const usdc = Number(pool.reserves.find((r) => r.asset === USDC_ID)?.amount);
-      if (xlm > 10_000 && usdc > 0) {
+      if (!(xlm > 10_000 && usdc > 0)) detail += '; classic pool cross-check not run (pool too small)';
+      else {
         const poolPrice = usdc / xlm;
         const div = Math.abs(mid - poolPrice) / poolPrice;
         if (div > XLM_MAX_POOL_DIVERGENCE)
@@ -182,6 +186,11 @@ export async function priceAsset(asset: AssetId, xlm: PriceResult): Promise<Pric
 
 export type DepthValue = { ok: true; usd: number; ratio: number } | { ok: false; reason: string };
 
+/** Whether valuing `amount` at depth needs a path-finding request (path-priced holdings worth more than 2 probes). */
+export function depthCheckNeeded(amount: number, price: Price): boolean {
+  return price.source === 'sdex_amm_path' && amount * price.usd > PROBE_USD * 2;
+}
+
 /**
  * Value of a whole holding at market depth: the USD proceeds of selling the
  * full amount through the best path (as the Serialized API values positions
@@ -189,7 +198,7 @@ export type DepthValue = { ok: true; usd: number; ratio: number } | { ok: false;
  */
 export async function valueAtDepth(asset: AssetId, amount: number, price: Price, xlm: PriceResult): Promise<DepthValue> {
   const spot = amount * price.usd;
-  if (price.source !== 'sdex_amm_path' || spot <= PROBE_USD * 2) return { ok: true, usd: spot, ratio: 1 };
+  if (!depthCheckNeeded(amount, price)) return { ok: true, usd: spot, ratio: 1 };
   const amt = amountString(amount);
   if (!amt) return { ok: true, usd: spot, ratio: 1 };
   try {

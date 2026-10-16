@@ -114,12 +114,29 @@ export type Verification =
   | { status: 'not_checked'; detail: string }
   | { status: 'error'; detail: string };
 
+/**
+ * Any issuer can set any home_domain, and every visitor's browser would fetch
+ * https://<home_domain>/.well-known/stellar.toml. Only public DNS hostnames
+ * are fetched: no IP literal, no port, no single-label name such as
+ * localhost, and never a Serialized host.
+ */
+const PUBLIC_HOSTNAME = /^(?=.{4,253}$)(?!-)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
+const REFUSED_DOMAINS = ['serialized.xyz', 'serialized.cloud', 'serializedaudit.io', 'serialized.trade'];
+
+export function isFetchableHomeDomain(domain: string): boolean {
+  const d = domain.toLowerCase();
+  if (!PUBLIC_HOSTNAME.test(d)) return false;
+  return !REFUSED_DOMAINS.some((r) => d === r || d.endsWith(`.${r}`));
+}
+
 /** SEP-1 verification of one classic asset. Never throws. */
 export async function verifyAsset(code: string, issuer: string): Promise<Verification> {
   try {
     const info = await getIssuer(issuer);
     if (!info.exists) return { status: 'issuer_missing', detail: 'issuer account no longer exists (merged)' };
     if (!info.homeDomain) return { status: 'no_home_domain', detail: 'issuer sets no home domain' };
+    if (!isFetchableHomeDomain(info.homeDomain))
+      return { status: 'toml_error', domain: info.homeDomain, detail: 'home domain is not a public hostname: stellar.toml not fetched' };
     const toml = await getStellarToml(info.homeDomain);
     if (!toml.ok) return { status: 'toml_error', domain: info.homeDomain, detail: toml.error };
     const cur = toml.currencies.find((c) => c.code === code && c.issuer === issuer);

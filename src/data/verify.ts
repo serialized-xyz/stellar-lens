@@ -26,6 +26,8 @@ export type VerifyStatus =
   | 'changed'
   /** Same entry version but different values: a real discrepancy. */
   | 'mismatch'
+  /** The RPC node answered with an older version of the entry than the data shown: it lags, retry. */
+  | 'behind'
   /** The entry does not exist on the ledger. */
   | 'missing'
   | 'error';
@@ -47,6 +49,8 @@ export interface VerifyResult {
   shownLastModified: number | null;
   checks: FieldCheck[];
   endpoint: string | null;
+  /** RPC method that read the ledger. */
+  method: 'getLedgerEntries' | 'simulateTransaction' | null;
   message: string;
 }
 
@@ -60,7 +64,7 @@ function outcome(
 ): VerifyResult {
   const allEqual = checks.every((c) => c.equal);
   const n = (x: number) => `#${x.toLocaleString('en-US')}`;
-  const base = { ledger: latestLedger, entryLastModified: rpcLast, shownLastModified: shownLast, checks, endpoint };
+  const base = { ledger: latestLedger, entryLastModified: rpcLast, shownLastModified: shownLast, checks, endpoint, method: 'getLedgerEntries' as const };
   if (allEqual) return { ...base, status: 'match', message: `Matches ledger state ${n(latestLedger)} (${what})` };
   if (shownLast !== null && rpcLast > shownLast)
     return {
@@ -68,6 +72,13 @@ function outcome(
       status: 'changed',
       message: `Newer ledger state: the ${what} changed in ledger ${n(rpcLast)}, after this page loaded (shown data is from ${n(shownLast)}). Refresh to update.`,
     };
+  if (shownLast !== null && rpcLast < shownLast)
+    return {
+      ...base,
+      status: 'behind',
+      message: `The RPC node is behind the data shown: it serves the ${what} as of ledger ${n(rpcLast)}, the page shows its version of ${n(shownLast)}. Retry in a few seconds.`,
+    };
+  // Same entry version (or no version to compare): a real discrepancy.
   return { ...base, status: 'mismatch', message: `Mismatch: the ${what} shown differs from ledger state ${n(latestLedger)}` };
 }
 
@@ -107,11 +118,18 @@ export async function verifyHolding(h: Holding, account: string): Promise<Verify
         const e = byKey.get(key);
         if (!e) return missing(latestLedger, endpoint, 'trustline');
         const t = decodeTrustline(e.xdr);
+        // Horizon reports authorized-to-maintain-liabilities as true whenever
+        // the trustline is fully authorized (flag 1) or limited to
+        // maintaining liabilities (flag 2).
+        const maintain = (t.flags & (TRUSTLINE_FLAGS.AUTHORIZED | TRUSTLINE_FLAGS.AUTHORIZED_TO_MAINTAIN_LIABILITIES)) !== 0;
         const checks = [
           check('balance', fromStroops(h.stroops), fromStroops(t.balance)),
           check('authorized', String(h.flags.authorized), String((t.flags & TRUSTLINE_FLAGS.AUTHORIZED) !== 0)),
+          check('maintain liabilities', String(h.flags.authorizedToMaintainLiabilities), String(maintain)),
           check('clawback enabled', String(h.flags.clawbackEnabled), String((t.flags & TRUSTLINE_FLAGS.CLAWBACK_ENABLED) !== 0)),
           check('limit', h.limit, fromStroops(t.limit)),
+          check('buying liabilities', h.buyingLiabilities, fromStroops(t.buyingLiabilities)),
+          check('selling liabilities', h.sellingLiabilities, fromStroops(t.sellingLiabilities)),
         ];
         return outcome(checks, e.lastModifiedLedgerSeq, h.lastModifiedLedger, latestLedger, endpoint, `${h.code} trustline`);
       }
@@ -138,19 +156,28 @@ export async function verifyHolding(h: Holding, account: string): Promise<Verify
         return outcome(checks, tl.lastModifiedLedgerSeq, h.lastModifiedLedger, latestLedger, endpoint, 'pool share trustline');
       }
       case 'sep41': {
-        const r = await readSep41(h.contractId, account);
+        // A fresh simulation: never the cached answer the page was built from.
+        const r = await readSep41(h.contractId, account, { fresh: true });
         const checks = [check('balance()', h.amount, fromStroops(r.balance, r.decimals))];
         const equal = checks[0].equal;
+        const n = (x: number) => `#${x.toLocaleString('en-US')}`;
+        const status: VerifyStatus = equal ? 'match' : r.latestLedger > h.checkedAtLedger ? 'changed' : r.latestLedger < h.checkedAtLedger ? 'behind' : 'mismatch';
         return {
-          status: equal ? 'match' : 'changed',
+          status,
           ledger: r.latestLedger,
           entryLastModified: null,
           shownLastModified: h.checkedAtLedger,
           checks,
-          endpoint: null,
-          message: equal
-            ? `Matches ledger state #${r.latestLedger.toLocaleString('en-US')} (balance() simulation)`
-            : `Newer ledger state: balance() now returns ${checks[0].ledger} at ledger #${r.latestLedger.toLocaleString('en-US')} (shown: ${h.amount} at #${h.checkedAtLedger.toLocaleString('en-US')})`,
+          endpoint: r.endpoint,
+          method: 'simulateTransaction',
+          message:
+            status === 'match'
+              ? `Matches ledger state ${n(r.latestLedger)} (balance() simulation)`
+              : status === 'changed'
+                ? `Newer ledger state: balance() now returns ${checks[0].ledger} at ledger ${n(r.latestLedger)} (shown: ${h.amount} at ${n(h.checkedAtLedger)})`
+                : status === 'behind'
+                  ? `The RPC node is behind the data shown: it simulated at ledger ${n(r.latestLedger)}, the page read ${n(h.checkedAtLedger)}. Retry in a few seconds.`
+                  : `Mismatch: balance() returns ${checks[0].ledger} at ledger ${n(r.latestLedger)}, the page shows ${h.amount} read at the same ledger`,
         };
       }
     }
@@ -162,6 +189,7 @@ export async function verifyHolding(h: Holding, account: string): Promise<Verify
       shownLastModified: h.lastModifiedLedger,
       checks: [],
       endpoint: null,
+      method: null,
       message: `Could not read the ledger: ${describeError(err)}`,
     };
   }
@@ -175,6 +203,7 @@ function missing(latestLedger: number, endpoint: string, what: string): VerifyRe
     shownLastModified: null,
     checks: [],
     endpoint,
+    method: 'getLedgerEntries',
     message: `No ${what} on the ledger at #${latestLedger.toLocaleString('en-US')}: it was removed after this page loaded, or the data shown is wrong.`,
   };
 }
