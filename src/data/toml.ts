@@ -106,7 +106,15 @@ export function getIssuer(issuer: string): Promise<IssuerInfo> {
 }
 
 export type Verification =
-  | { status: 'verified'; domain: string; orgName: string | null; currencyName: string | null }
+  | {
+      status: 'verified';
+      domain: string;
+      orgName: string | null;
+      currencyName: string | null;
+      /** Where the issuer-asset pair was confirmed: the issuer's stellar.toml, or the issuer's own published docs. */
+      source: 'stellar.toml' | 'issuer docs';
+      sourceUrl: string;
+    }
   | { status: 'not_listed'; domain: string; detail: string }
   | { status: 'no_home_domain'; detail: string }
   | { status: 'toml_error'; domain: string; detail: string }
@@ -129,8 +137,49 @@ export function isFetchableHomeDomain(domain: string): boolean {
   return !REFUSED_DOMAINS.some((r) => d === r || d.endsWith(`.${r}`));
 }
 
-/** SEP-1 verification of one classic asset. Never throws. */
+/**
+ * Issuer-asset pairs confirmed by the issuer's own published documentation,
+ * used when the issuer's stellar.toml cannot confirm them. Circle sets
+ * home_domain circle.com on its Stellar issuers, but
+ * https://circle.com/.well-known/stellar.toml redirects to a 404 (checked
+ * 2026-10-16), so SEP-1 alone would show USDC and EURC as unverified.
+ */
+const ISSUER_DOCS: { code: string; issuer: string; domain: string; orgName: string; currencyName: string; url: string }[] = [
+  {
+    code: 'USDC',
+    issuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
+    domain: 'circle.com',
+    orgName: 'Circle',
+    currencyName: 'USD Coin',
+    url: 'https://developers.circle.com/stablecoins/usdc-contract-addresses',
+  },
+  {
+    code: 'EURC',
+    issuer: 'GDHU6WRG4IEQXM5NZ4BMPKOXHW76MZM4Y2IEMFDVXBSDP6SJY4ITNPP2',
+    domain: 'circle.com',
+    orgName: 'Circle',
+    currencyName: 'EURC',
+    url: 'https://developers.circle.com/stablecoins/eurc-contract-addresses',
+  },
+];
+
+/** SEP-1 verification of one classic asset, then the issuer-docs registry. Never throws. */
 export async function verifyAsset(code: string, issuer: string): Promise<Verification> {
+  const sep1 = await verifyAssetSep1(code, issuer);
+  if (sep1.status === 'verified' || sep1.status === 'issuer_missing') return sep1;
+  const doc = ISSUER_DOCS.find((d) => d.code === code && d.issuer === issuer);
+  if (!doc) return sep1;
+  return {
+    status: 'verified',
+    domain: doc.domain,
+    orgName: doc.orgName,
+    currencyName: doc.currencyName,
+    source: 'issuer docs',
+    sourceUrl: doc.url,
+  };
+}
+
+async function verifyAssetSep1(code: string, issuer: string): Promise<Verification> {
   try {
     const info = await getIssuer(issuer);
     if (!info.exists) return { status: 'issuer_missing', detail: 'issuer account no longer exists (merged)' };
@@ -146,7 +195,14 @@ export async function verifyAsset(code: string, issuer: string): Promise<Verific
         domain: info.homeDomain,
         detail: `${info.homeDomain} stellar.toml does not list ${code} from this issuer`,
       };
-    return { status: 'verified', domain: info.homeDomain, orgName: toml.orgName, currencyName: cur.name ?? null };
+    return {
+      status: 'verified',
+      domain: info.homeDomain,
+      orgName: toml.orgName,
+      currencyName: cur.name ?? null,
+      source: 'stellar.toml',
+      sourceUrl: `https://${info.homeDomain}/.well-known/stellar.toml`,
+    };
   } catch (err) {
     return { status: 'error', detail: describeError(err) };
   }

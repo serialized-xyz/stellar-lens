@@ -274,4 +274,4 @@ The production version replaces every public read with Serialized's own Stellar 
 
 ## License
 
-None yet.
+[MIT](LICENSE).

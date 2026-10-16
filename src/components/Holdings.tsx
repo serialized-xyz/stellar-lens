@@ -99,7 +99,14 @@ function VerificationLine({ h }: { h: CreditHolding }) {
   if (v.status === 'verified')
     return (
       <span className="asset-sub">
-        <span className="verified" title={`Listed in https://${v.domain}/.well-known/stellar.toml${v.orgName ? ` (${v.orgName})` : ''}`}>
+        <span
+          className="verified"
+          title={
+            v.source === 'stellar.toml'
+              ? `Listed in ${v.sourceUrl}${v.orgName ? ` (${v.orgName})` : ''}`
+              : `Issuer listed in ${v.orgName ?? v.domain}'s official docs: ${v.sourceUrl}`
+          }
+        >
           <Icon name="check" size={12} />
           {v.domain}
         </span>

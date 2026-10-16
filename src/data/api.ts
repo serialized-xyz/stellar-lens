@@ -173,7 +173,9 @@ function positionItem(h: Holding, totalValueUsd: number) {
           issuer: h.issuer,
           homeDomain: v && 'domain' in v ? v.domain : null,
           verified: v?.status === 'verified',
-          verification: v ? { status: v.status, detail: 'detail' in v ? v.detail : null } : null,
+          verification: v
+            ? { status: v.status, detail: 'detail' in v ? v.detail : null, source: v.status === 'verified' ? v.sourceUrl : null }
+            : null,
           sacContractId: h.sacContractId,
           trustline: {
             authorized: h.flags.authorized,

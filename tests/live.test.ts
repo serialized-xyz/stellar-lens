@@ -625,6 +625,17 @@ await test('history floor: meta.historyFrom is the close time of Horizon\'s olde
   return `Horizon serves history from ${new Date(from).toISOString()}`;
 });
 
+await test('Circle USDC and EURC are verified (SEP-1, else Circle\'s published issuer list)', async () => {
+  const { verifyAsset } = await import('../src/data/toml.ts');
+  const usdc = await verifyAsset('USDC', 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN');
+  const eurc = await verifyAsset('EURC', 'GDHU6WRG4IEQXM5NZ4BMPKOXHW76MZM4Y2IEMFDVXBSDP6SJY4ITNPP2');
+  const fake = await verifyAsset('USDC', 'GDHU6WRG4IEQXM5NZ4BMPKOXHW76MZM4Y2IEMFDVXBSDP6SJY4ITNPP2');
+  if (usdc.status !== 'verified' || eurc.status !== 'verified') throw new Error(`USDC ${usdc.status}, EURC ${eurc.status}`);
+  if (fake.status === 'verified') throw new Error('a USDC code from the EURC issuer must not be verified');
+  return `USDC via ${usdc.source}, EURC via ${eurc.source}; impostor pair stays ${fake.status}`;
+});
+
+
 // ------------------------------------------------------------------ summary
 
 const failed = results.filter((r) => !r.ok);
