@@ -1,0 +1,3 @@
+# Supply-chain guard: never resolve a package version (direct or transitive)
+# published less than 14 days ago (20160 minutes).
+minimumReleaseAge: 20160
