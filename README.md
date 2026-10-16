@@ -1,5 +1,7 @@
 # Serialized Stellar Lens
 
+**Live preview: https://serialized-xyz.github.io/stellar-lens/** (Stellar mainnet, read only).
+
 **A public proof of concept of Stellar support in the Serialized Data API.**
 Enter any Stellar account (or connect Freighter, xBull or another wallet) and
 Lens shows its holdings, reserves, USD values and history, in the same JSON
