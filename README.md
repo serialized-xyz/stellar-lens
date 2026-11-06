@@ -267,6 +267,10 @@ pnpm test             # node tests/live.test.ts, against Stellar mainnet
 
 The production version replaces every public read with Serialized's own Stellar ingestion: complete holdings from ledger state (trustlines, SAC and every SEP-41 balance, CAP-38 shares), one history across classic operations and Soroban events, USD prices for every asset from SDEX, classic pools and Soroban AMM trades, candles, and streams at ledger close, served on the same `/v1/wallet/*` endpoints with `chain=stellar`. See [serialized.xyz](https://serialized.xyz) and [docs.serialized.xyz](https://docs.serialized.xyz).
 
+## Validation spike
+
+[`spike/`](spike/) holds the scripts of the feasibility spike of 23 October 2026: Stellar mainnet read from the public ledger archive, decoded with our own code and compared with Horizon, Stellar RPC and StellarExpert (66 of 66 ledgers of trades, 190 of 190 ledger entries and 73 of 73 Soroban swaps identical). Results and commands are in [spike/README.md](spike/README.md).
+
 ## Tech notes
 
 - Vite 8, React 19, TypeScript 5.9 (strict), plain CSS, `@stellar/stellar-sdk` 17.2.1, `@creit.tech/stellar-wallets-kit` 2.7.0. All versions are exact; `pnpm-workspace.yaml` sets `minimumReleaseAge: 20160` (14 days) for direct and transitive dependencies, and package build scripts are not run.
