@@ -31,7 +31,9 @@ function useLedgerTicker() {
           const { result, endpoint } = await getHealth();
           const close = Number(result.latestLedgerCloseTime);
           if (Number.isFinite(close) && close > 0) {
-            setTick({ seq: result.latestLedger, closedAt: close * 1000, source: `Stellar RPC getHealth (${new URL(endpoint).host})` });
+            // Protocol 30 (CAP-88) moves ledger close times to milliseconds: accept both units.
+            const closedAt = close > 1e12 ? close : close * 1000;
+            setTick({ seq: result.latestLedger, closedAt, source: `Stellar RPC getHealth (${new URL(endpoint).host})` });
           } else {
             const l = await getLatestLedger();
             setTick({ seq: l.sequence, closedAt: Date.parse(l.closed_at), source: 'Horizon /ledgers' });
